@@ -1,82 +1,132 @@
 #!/usr/bin/env bash
-# Basic and mandatory settings for the base of an OS customization run
-# Written by Gina Haeussge <gina at octoprint dot org>, 
-# based on work by Guy Sheffer <guysoft at gmail dot com>
-# GPL V3
-########
 set -x
 set -e
-
-export LC_ALL=C
+# CustoPiZer auto-hotspot module
+# Raspberry Pi CM5 - Trixie 64-bit
+# GPL V3
+########
 
 source /common.sh
 install_cleanup_trap
 
-# add build hostname
-sed -i "/^127\.0\.0\.1\s/ s/$/ ${HOSTNAME}/" /etc/hosts
-
-if [[ "${EDITBASE_DISTRO}" == "armbian" || "${EDITBASE_DISTRO}" == "ubuntu" ]]; then
-  # workaround for Armbian > 24.5, because it uses a symlink for /etc/resolv.conf
-  if [ -h /etc/resolv.conf ]; then
-    link_target="$(readlink /etc/resolv.conf)"
-    echo "${link_target}" > /etc/resolv.conf.link
-    rm -f /etc/resolv.conf
-  else
-    mv /etc/resolv.conf /etc/resolv.conf.orig || true
-  fi
-
-  # Set up resolv.conf with Google & Cloudflare public DNS servers
-  echo "nameserver 8.8.8.8" > /etc/resolv.conf
-  echo "nameserver 8.8.4.4" >> /etc/resolv.conf
-  echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-fi
-
-if [ "${EDITBASE_DISTRO}" == "ubuntu" ]; then
-  unpack /filesystem/ubuntu / root
-  
-  apt-get update --allow-releaseinfo-change
-  apt-get install -y net-tools wireless-tools dhcpcd5
-  if [ $( is_in_apt policykit-1 ) -eq 1 ]; then
-    apt-get -y install policykit-1
-  fi
-  
-  # prevent any installed services from automatically starting
-  echo exit 101 > /usr/sbin/policy-rc.d
-  chmod +x /usr/sbin/policy-rc.d
-  systemctl enable dhcpcd.service
-  
-  #Undo prevent any installed services from automatically starting
-  rm -r /usr/sbin/policy-rc.d || true
-fi
-
-if [ -n "$EDITBASE_APT_PROXY" ]
-then
-  echo "Acquire::http { Proxy \"http://$EDITBASE_APT_PROXY\"; };" > /etc/apt/apt.conf.d/02octopi_build_proxy
-fi
-
-if [ -n "$EDITBASE_PYPI_INDEX" ]
-then
-  pip_index_config="[global]\nindex-url = $EDITBASE_PYPI_INDEX"
-  easyinstall_index_config="[easy_install]\nindex-url = $EDITBASE_PYPI_INDEX"
-
-  mkdir -p /root/.pip
-  echo -e "$pip_index_config" > /root/.pip/pip.conf
-  echo -e "$easyinstall_index_config" > /root/.pydistutils.cfg
-
-  mkdir -p /home/"${EDITBASE_USER}"/.pip
-  sudo -u "${EDITBASE_USER}" echo -e "$pip_index_config" > /home/pi/.pip/pip.conf
-  sudo -u "${EDITBASE_USER}" echo -e "$easyinstall_index_config" > /home/pi/.pydistutils.cfg
-
-  echo "Configured pypi index url $BASE_PYPI_INDEX"
-  cat /home/"${EDITBASE_USER}"/.pip/pip.conf
-  cat /home/"${EDITBASE_USER}"/.pydistutils.cfg
-fi
-
+# ---------------------------------------------------------------------------
+# Trixie: policykit-1 no longer exists — install real replacements and
+# create a dummy package so other modules that reference policykit-1 don't fail
+# ---------------------------------------------------------------------------
 apt-get update --allow-releaseinfo-change
-if [ $( is_in_apt policykit-1 ) -eq 1 ]; then
-  sudo apt-get -y install policykit-1
+
+apt-get install -y equivs polkitd pkexec
+
+if ! dpkg -l policykit-1 2>/dev/null | grep -q '^ii'; then
+    _tmpdir=$(mktemp -d)
+    cat > "$_tmpdir/policykit-1.ctl" <<'EQUIVS'
+Section: misc
+Priority: optional
+Standards-Version: 3.9.2
+Package: policykit-1
+Version: 999
+Maintainer: shim
+Architecture: all
+Provides: policykit-1
+Description: Transitional shim - Trixie replaced policykit-1 with polkitd + pkexec
+EQUIVS
+    (cd "$_tmpdir" && equivs-build policykit-1.ctl && dpkg -i policykit-1_999_all.deb)
+    rm -rf "$_tmpdir"
 fi
 
-# prevent any installed services from automatically starting
-echo exit 101 > /usr/sbin/policy-rc.d
-chmod +x /usr/sbin/policy-rc.d
+# ---------------------------------------------------------------------------
+# Packages
+# dns-root-data no longer exists on Trixie
+# ---------------------------------------------------------------------------
+apt-get -y purge dns-root-data || true
+apt-get -y install --no-install-recommends iw rfkill hostapd dnsmasq iptables
+
+# On Trixie, hostapd is masked by default — unmask before disabling
+systemctl unmask hostapd || true
+systemctl disable hostapd || true
+systemctl disable dnsmasq || true
+
+# ---------------------------------------------------------------------------
+# Unpack filesystem overlay (CustomPiOS/CustoPiZer compatible)
+# ---------------------------------------------------------------------------
+unpack /filesystem/root /
+
+# ---------------------------------------------------------------------------
+# Set hotspot name, password and channel
+# ---------------------------------------------------------------------------
+sed -i "s/HOTSPOT_NAME/${HOTSPOT_NAME}/g"         /etc/hostapd/hostapd.conf
+sed -i "s/HOTSPOT_PASSWORD/${HOTSPOT_PASSWORD}/g" /etc/hostapd/hostapd.conf
+sed -i "s/HOTSPOT_CHANNEL/${HOTSPOT_CHANNEL}/g"   /etc/hostapd/hostapd.conf
+
+# ---------------------------------------------------------------------------
+# hostapd: point systemd unit to config file
+# /etc/default/hostapd no longer exists on Trixie — use systemd drop-in
+# ---------------------------------------------------------------------------
+if [ -f /etc/default/hostapd ]; then
+    if grep -q "DAEMON_CONF" /etc/default/hostapd; then
+        sed -i 's@#DAEMON_CONF=""@DAEMON_CONF="/etc/hostapd/hostapd.conf"@g' /etc/default/hostapd
+    else
+        echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' >> /etc/default/hostapd
+    fi
+    sed -i 's@^DAEMON_OPTS=""@#DAEMON_OPTS=""@g' /etc/default/hostapd
+else
+    mkdir -p /etc/systemd/system/hostapd.service.d
+    cat > /etc/systemd/system/hostapd.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/hostapd /etc/hostapd/hostapd.conf
+EOF
+fi
+
+# ---------------------------------------------------------------------------
+# dhcpcd replaced by NetworkManager on Trixie — only patch if still present
+# ---------------------------------------------------------------------------
+if [ -f /etc/dhcpcd.conf ]; then
+    sed -i 's/clientid/# clientid/g' /etc/dhcpcd.conf
+fi
+
+# ---------------------------------------------------------------------------
+# dnsmasq: use drop-in to avoid conflict with NetworkManager
+# ---------------------------------------------------------------------------
+mkdir -p /etc/dnsmasq.d
+cat > /etc/dnsmasq.d/autohotspot.conf <<'EOF'
+# Auto-hotspot Config
+interface=wlan0
+bind-interfaces
+dhcp-range=192.168.50.150,192.168.50.200,255.255.255.0,12h
+EOF
+
+# ---------------------------------------------------------------------------
+# Disable IP forwarding by default (autohotspotN enables it when needed)
+# ---------------------------------------------------------------------------
+sed -i 's/net.ipv4.ip_forward=1/#net.ipv4.ip_forward=1/g' /etc/sysctl.conf
+
+# ---------------------------------------------------------------------------
+# /etc/network/interfaces — only modify if ifupdown is present
+# On Trixie, NetworkManager handles networking by default
+# ---------------------------------------------------------------------------
+if dpkg -l ifupdown 2>/dev/null | grep -q '^ii'; then
+    cp /etc/network/interfaces /etc/network/interfaces-backup
+    echo "" > /etc/network/interfaces
+fi
+
+# ---------------------------------------------------------------------------
+# udev rule: unblock WiFi at boot (CM5 may have rfkill soft-block)
+# ---------------------------------------------------------------------------
+cat > /etc/udev/rules.d/90-wifi-unblock.rules <<'EOF'
+ACTION=="add", SUBSYSTEM=="rfkill", ATTR{type}=="wlan", ATTR{soft}="0"
+EOF
+
+# ---------------------------------------------------------------------------
+# NetworkManager: placeholder to signal autohotspot manages wlan0
+# ---------------------------------------------------------------------------
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/autohotspot-unmanaged.conf <<'EOF'
+# autohotspot: wlan0 is managed by the autohotspot service via nmcli.
+# This file is a placeholder; the service updates NM state at runtime.
+EOF
+
+# ---------------------------------------------------------------------------
+# Enable autohotspot at boot
+# ---------------------------------------------------------------------------
+systemctl enable autohotspot.service
